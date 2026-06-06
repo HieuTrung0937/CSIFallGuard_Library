@@ -20,7 +20,7 @@
 #include "esp_now.h"
 
 // 5. Driver ngoại vi (LED NeoPixel)
-#include "led_strip.h"
+// #include "led_strip.h"
 #include "driver/gpio.h"
 
 // 6. Cấu hình định tuyến và gói tin của dự án
