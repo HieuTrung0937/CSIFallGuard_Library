@@ -82,7 +82,8 @@ public:
      */
     bool isLying();
     bool isPersonPresent();
-
+    int16_t csi_raw_buffer[104];  // Buffer cho CSI raw data
+    void computeAmplitudes(int16_t *csi_raw, float *amplitudes);
     bool isFallDetected();
 private:
     QueueHandle_t      event_queue_ = nullptr;   //!< Hàng đợi dữ liệu từ callback ISR

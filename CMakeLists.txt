@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS 
+        "src/tx/EspNowTransmitter.cpp"
+        "src/rx/CsiReceiver.cpp"
+    INCLUDE_DIRS 
+        "src/common"
+        "src/tx"
+        "src/rx"
+    REQUIRES 
+        nvs_flash
+        esp_wifi
+        esp_now
+        led_strip
+)

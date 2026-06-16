@@ -3,11 +3,12 @@
 #include "tx/EspNowTransmitter.hpp"
 #include <string.h>
 
-static int s_mode = -1;
-static int s_channel = 1;
-static uint8_t s_tx_mac[6];
-static uint8_t s_rx_mac[6];
+// ===== ĐỊNH NGHĨA BIẾN TOÀN CỤC (KHÔNG static) =====
+uint8_t s_tx_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+uint8_t s_rx_mac[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+int s_channel = 1;
 
+static int s_mode = -1;
 static EspNowTransmitter s_tx;
 static CsiReceiver s_rx;
 
@@ -38,7 +39,7 @@ void CSIFallGuard_begin(int mode, int channel) {
 
 void CSIFallGuard_update(void) {}
 
-// ===== TX APIs (giữ nguyên) =====
+// ===== TX APIs =====
 void CSIFallGuard_set_tx_power(int power) {}
 void CSIFallGuard_set_tx_frequency(int hz) {}
 uint32_t CSIFallGuard_get_tx_packet_count(void) { return 0; }
@@ -48,20 +49,15 @@ void CSIFallGuard_set_rx_threshold(int standing, int lying) {
     s_rx.setThreshold(standing, lying);
 }
 
-void CSIFallGuard_register_fall_callback(void (*cb)(void)) {
-    // chưa implement callback trong CsiReceiver, tạm bỏ qua
-}
-
-void CSIFallGuard_register_person_callback(void (*cb)(bool)) {
-    // chưa implement callback
-}
+void CSIFallGuard_register_fall_callback(void (*cb)(void)) {}
+void CSIFallGuard_register_person_callback(void (*cb)(bool)) {}
 
 int CSIFallGuard_get_rssi(void) { return 0; }
 int CSIFallGuard_get_delta(void) { return 0; }
 bool CSIFallGuard_is_person(void) { return s_rx.isPersonPresent(); }
 bool CSIFallGuard_is_fall(void) { return s_rx.isFallDetected(); }
 
-// ===== THÊM CÁC HÀM MỚI =====
+// ===== HÀM MỚI =====
 void CSIFallGuard_set_print_mode(uint8_t mode) {
     s_rx.setPrintMode(mode);
 }
