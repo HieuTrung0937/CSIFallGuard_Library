@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 
+int s_last_rssi_delta = 0;
 extern int s_channel;
 CsiReceiver *CsiReceiver::s_instance = nullptr;
 
@@ -15,48 +16,38 @@ typedef struct {
     uint8_t  addr3[6];
 } __attribute__((packed)) wifi_80211_hdr_t;
 
-// ============================================================
-// SO SÁNH FLOAT CHO QSORT
-// ============================================================
 static int compare_float(const void *a, const void *b) {
     float fa = *(const float*)a;
     float fb = *(const float*)b;
     return (fa > fb) - (fa < fb);
 }
 
-// ============================================================
-// PROMISCUOUS CALLBACK (ISR) - GIẢI MÃ CSI
-// ============================================================
 void IRAM_ATTR CsiReceiver::s_promiscuous_cb(void *buf, wifi_promiscuous_pkt_type_t type) {
     if (!s_instance) return;
 
     auto *pkt = (wifi_promiscuous_pkt_t*)buf;
     auto *hdr = (wifi_80211_hdr_t*)pkt->payload;
 
-    // Lọc MAC TX
     extern uint8_t s_tx_mac[6];
     if (memcmp(hdr->addr2, s_tx_mac, 6) != 0) return;
 
     uint32_t seq = s_instance->pkt_count_ + 1;
     s_instance->pkt_count_ = seq;
 
-    // ===== LẤY CSI RAW - CÓ THỂ ĐIỀU CHỈNH OFFSET =====
-    #define CSI_OFFSET 34  // Thử 32, 34, 36
+    #define CSI_OFFSET 34
     int16_t *csi_data = (int16_t*)(pkt->payload + CSI_OFFSET);
     
-    // Lưu vào event
     csi_event_t ev;
     ev.seq = seq;
     ev.rssi = pkt->rx_ctrl.rssi;
     ev.sig_len = pkt->rx_ctrl.sig_len;
     memcpy(ev.csi_raw, csi_data, 104 * sizeof(int16_t));
 
-    // Debug: in 10 subcarrier đầu mỗi 100 gói
     static uint32_t last_print = 0;
-    if (seq - last_print > 100) {
+    if (seq - last_print > 500) {
         last_print = seq;
         printf("CSI[%lu]: ", seq);
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 5; i++) {
             printf("(%d,%d) ", ev.csi_raw[i*2], ev.csi_raw[i*2+1]);
         }
         printf("\n");
@@ -67,9 +58,6 @@ void IRAM_ATTR CsiReceiver::s_promiscuous_cb(void *buf, wifi_promiscuous_pkt_typ
     if (wake) portYIELD_FROM_ISR();
 }
 
-// ============================================================
-// TÍNH AMPLITUDE 52 SUBCARRIER
-// ============================================================
 static inline void compute_amplitudes(int16_t *csi_raw, float *amplitudes) {
     for (int i = 0; i < 52; i++) {
         int16_t I = csi_raw[i * 2];
@@ -78,9 +66,6 @@ static inline void compute_amplitudes(int16_t *csi_raw, float *amplitudes) {
     }
 }
 
-// ============================================================
-// LỌC TRUNG VỊ: CHỌN 30 SUBCARRIER Ở GIỮA
-// ============================================================
 static int median_filter(float *input, float *output, int size, int keep) {
     float sorted[52];
     memcpy(sorted, input, size * sizeof(float));
@@ -94,20 +79,35 @@ static int median_filter(float *input, float *output, int size, int keep) {
 }
 
 // ============================================================
-// RSSI PROCESSING
+// processRSSI - PHÂN BIỆT NGỒI (DAO ĐỘNG) VS NẰM (ỔN ĐỊNH)
 // ============================================================
 void CsiReceiver::processRSSI(int rssi, uint32_t seq) {
     static int win[8] = {0};
     static int idx = 0, filled = 0;
     static int baseline = 0, base_cnt = 0;
     static bool base_ready = false;
+    
+    // Lưu lịch sử delta để tính độ ổn định
+    static int delta_history[40] = {0};  // Tăng từ 30 lên 40
+    static int history_idx = 0;
+    static int history_filled = 0;
+    
+    // Lưu lịch sử RSSI filtered để phát hiện xu hướng
+    static int rssi_history[30] = {0};   // Tăng từ 20 lên 30
+    static int rssi_idx = 0;
+    static int rssi_filled = 0;
 
+    // Lọc trung bình động
     win[idx++] = rssi;
     if (idx >= 8) { idx = 0; filled = 1; }
     int n = filled ? 8 : idx;
     int sum = 0;
     for (int i = 0; i < n; i++) sum += win[i];
     int filtered = sum / n;
+
+    // Lưu lịch sử RSSI
+    rssi_history[rssi_idx++] = filtered;
+    if (rssi_idx >= 30) { rssi_idx = 0; rssi_filled = 1; }
 
     if (!base_ready && seq < 256) {
         if (base_cnt == 0) baseline = filtered;
@@ -125,126 +125,232 @@ void CsiReceiver::processRSSI(int rssi, uint32_t seq) {
     int delta = abs(filtered - baseline);
     uint32_t now = esp_timer_get_time() / 1000;
 
+    // ★ GIỮ NGUYÊN ĐỊNH DẠNG RSSI CŨ
     printf("RSSI,%lu,%d,%d,%d,%d,%.1f\n", 
            (unsigned long)seq, rssi, filtered, delta, 
-           person_present_ ? 1 : 0, 0.0f);
+           is_lying_ ? 1 : 0, 0.0f);
 
-    static bool lying_candidate = false;
-    static uint32_t candidate_start = 0;
-
-    if (delta >= lying_delta_threshold_) {
-        if (!lying_candidate) {
-            lying_candidate = true;
-            candidate_start = now;
+    // Lưu lịch sử delta
+    delta_history[history_idx++] = delta;
+    if (history_idx >= 40) { history_idx = 0; history_filled = 1; }
+    
+    // Tính độ ổn định
+    int hist_len = history_filled ? 40 : history_idx;
+    if (hist_len > 15) {  // Tăng từ 10 lên 15
+        int avg = 0;
+        for (int i = 0; i < hist_len; i++) avg += delta_history[i];
+        avg /= hist_len;
+        
+        int variance = 0;
+        for (int i = 0; i < hist_len; i++) {
+            int diff = delta_history[i] - avg;
+            variance += diff * diff;
         }
-    } else {
-        lying_candidate = false;
+        variance /= hist_len;
+        int stability = sqrt(variance);
+        
+        // ★ TÍNH XU HƯỚNG RSSI (đang giảm hay tăng)
+        int rssi_len = rssi_filled ? 30 : rssi_idx;
+        int rssi_trend = 0;
+        int rssi_variance = 0;
+        if (rssi_len > 10) {
+            // Tính trung bình RSSI
+            int rssi_avg = 0;
+            for (int i = 0; i < rssi_len; i++) {
+                rssi_avg += rssi_history[i];
+            }
+            rssi_avg /= rssi_len;
+            
+            // Tính độ lệch chuẩn của RSSI (độ dao động)
+            int rssi_var = 0;
+            for (int i = 0; i < rssi_len; i++) {
+                int diff = rssi_history[i] - rssi_avg;
+                rssi_var += diff * diff;
+            }
+            rssi_var /= rssi_len;
+            rssi_variance = sqrt(rssi_var);
+            
+            // Tính xu hướng (so sánh 5 mẫu đầu và 5 mẫu cuối)
+            if (rssi_len > 10) {
+                int first_sum = 0, last_sum = 0;
+                for (int i = 0; i < 5; i++) {
+                    first_sum += rssi_history[i];
+                    last_sum += rssi_history[rssi_len - 5 + i];
+                }
+                rssi_trend = (last_sum - first_sum) / 5;  // Âm = đang giảm
+            }
+        }
+        
+        // ★ IN DEBUG để xem giá trị
+        if (seq % 50 == 0) {
+            printf("DEBUG: delta=%d, stability=%d, trend=%d, rssi_var=%d\n", 
+                   delta, stability, rssi_trend, rssi_variance);
+        }
+        
+        // ============================================================
+        // ★ PHÁT HIỆN NẰM (LYING) - PHÂN BIỆT NGỒI
+        // ============================================================
+        // ★ QUAN TRỌNG: 
+        //   - Ngồi: delta cao (7-10) NHƯNG stability CAO (>5) và rssi_variance CAO (>3)
+        //   - Nằm: delta cao (7-10) NHƯNG stability THẤP (<3) và rssi_variance THẤP (<2)
+        //   - Nằm lâu: trend gần 0 (ổn định), ngồi: trend dao động
+        
+        static bool still_candidate = false;
+        static uint32_t still_start = 0;
+        static int stable_count = 0;
+        
+        // ★ Điều kiện nằm: delta > 3 VÀ stability < 4 VÀ rssi_variance < 3
+        //   VÀ (trend đang giảm HOẶC trend gần 0 - đã ổn định)
+        bool is_lying_condition = (delta > 3) && 
+                                  (stability < 4) && 
+                                  (rssi_variance < 3) &&
+                                  (rssi_trend <= 1);  // Không tăng
+        
+        if (is_lying_condition) {
+            stable_count++;
+            if (stable_count >= 10) {  // ~1 giây
+                if (!still_candidate) {
+                    still_candidate = true;
+                    still_start = now;
+                    printf("LYING CANDIDATE: delta=%d, stability=%d, var=%d, trend=%d\n", 
+                           delta, stability, rssi_variance, rssi_trend);
+                }
+            }
+        } else {
+            stable_count = 0;
+            still_candidate = false;
+        }
+        
+        // ★ Xác nhận nằm sau 2 giây (tăng từ 1.5 lên 2)
+        if (still_candidate && !is_lying_ &&
+            (now - still_start) >= 2000) {
+            is_lying_ = true;
+            lying_start_time_ = now;
+            person_present_ = true;
+            if (print_mode_ & PRINT_MODE_STATE)
+                ESP_LOGW("CSI", "LYING detected (delta=%d, stability=%d, var=%d)", 
+                         delta, stability, rssi_variance);
+        }
+        
+        // ★ Thoát nằm: delta < 2 HOẶC stability > 6 HOẶC rssi_variance > 4
+        if (is_lying_ && (delta < 2 || stability > 6 || rssi_variance > 4) &&
+            (now - lying_start_time_) >= 1000) {
+            is_lying_ = false;
+            person_present_ = false;
+            if (print_mode_ & PRINT_MODE_STATE)
+                ESP_LOGI("CSI", "Exit lying (delta=%d, stability=%d, var=%d)", 
+                         delta, stability, rssi_variance);
+            still_candidate = false;
+            stable_count = 0;
+        }
     }
-
-    if (lying_candidate && !is_lying_ &&
-        (now - candidate_start) >= (uint32_t)lying_confirm_ms_) {
-        is_lying_ = true;
-        lying_start_time_ = now;
-        person_present_ = true;
-        if (print_mode_ & PRINT_MODE_STATE)
-            ESP_LOGW("CSI", "Lying confirmed (delta=%d dB)", delta);
-    }
-
-    if (is_lying_ && delta < (lying_delta_threshold_ / 2) &&
-        (now - lying_start_time_) >= (uint32_t)lying_exit_ms_) {
-        is_lying_ = false;
-        person_present_ = false;
-        if (print_mode_ & PRINT_MODE_STATE)
-            ESP_LOGI("CSI", "Exit lying state");
-    }
+    
+    s_last_rssi_delta = delta;
 }
 
 // ============================================================
-// CSI PROCESSING - PHÁT HIỆN TÉ NGÃ (CÓ LỌC TRUNG VỊ)
+// processCSI - PHÁT HIỆN FALL (CẦN SHOCK MẠNH + STILL)
 // ============================================================
 void CsiReceiver::processCSI(int16_t *csi_raw, uint32_t seq) {
-    static float baseline_amp[30] = {0};  // 30 subcarrier tốt nhất
+    static float baseline_amp[52] = {0};
     static bool base_ready = false;
     static int base_cnt = 0;
-    static uint32_t shock_time = 0;
-    static bool shock_detected = false;
+    static uint32_t fall_start = 0;
+    static bool fall_tracking = false;
+    static int shock_count = 0;
 
-    // Bước 1: Tính amplitude
     float cur[52];
     compute_amplitudes(csi_raw, cur);
 
-    // Bước 2: Lọc trung vị - giữ 30 subcarrier ở giữa
-    float filtered_cur[30];
-    int valid_count = median_filter(cur, filtered_cur, 52, 30);
-
-    // Debug valid_count
-    if (seq % 100 == 0) {
-        printf("valid_count: %d\n", valid_count);
+    float filtered_cur[52];
+    int valid_count = 0;
+    for (int i = 0; i < 52; i++) {
+        if (cur[i] > 5.0f && cur[i] < 10000.0f) {
+            filtered_cur[valid_count] = cur[i];
+            valid_count++;
+        }
     }
 
-    // Bước 3: Capture baseline (chỉ dùng 30 subcarrier tốt nhất)
+    if (valid_count < 15) return;
+
     if (!base_ready && seq < 256) {
         if (base_cnt == 0) {
-            for (int i = 0; i < valid_count; i++) {
-                baseline_amp[i] = filtered_cur[i];
-            }
+            for (int i = 0; i < valid_count; i++) baseline_amp[i] = filtered_cur[i];
         } else {
             for (int i = 0; i < valid_count; i++) {
                 baseline_amp[i] = (baseline_amp[i] + filtered_cur[i]) * 0.5f;
             }
         }
         base_cnt++;
-        if (seq == 255 && (print_mode_ & PRINT_MODE_STATE)) {
-            ESP_LOGI("CSI", "CSI baseline ready (valid: %d)", valid_count);
+        if (seq == 255) {
+            ESP_LOGI("CSI", "CSI Baseline ready (valid: %d)", valid_count);
             base_ready = true;
         }
         return;
     }
     if (!base_ready) return;
 
-    // Bước 4: Tính % thay đổi
     float total_change = 0;
     int change_count = 0;
     for (int i = 0; i < valid_count; i++) {
         if (baseline_amp[i] > 0.01f) {
-            float diff = fabs(filtered_cur[i] - baseline_amp[i]);
-            total_change += diff / baseline_amp[i];
+            total_change += fabs(filtered_cur[i] - baseline_amp[i]) / baseline_amp[i];
             change_count++;
         }
     }
-
-    if (change_count < 10) return;
+    if (change_count < 5) return;
 
     float avg_change = (total_change / change_count) * 100;
     uint32_t now = esp_timer_get_time() / 1000;
 
-    // In thông tin định kỳ
-    if (seq % 20 == 0) {
-        printf("Amp change: %.1f%% (valid: %d)\n", avg_change, change_count);
-    }
+    extern int s_last_rssi_delta;
+    int rssi_delta = s_last_rssi_delta;
 
-    // Bước 5: SHOCK (ngưỡng 35%)
-    if (avg_change > 35.0f && !shock_detected) {
-        shock_detected = true;
-        shock_time = now;
-        if (print_mode_ & PRINT_MODE_STATE)
-            ESP_LOGW("CSI", "SHOCK! change=%.1f%%", avg_change);
-    }
-
-    // Bước 6: STILL (sau shock, ổn định < 12%)
-    if (shock_detected && (now - shock_time) > 2000) {
-        if (avg_change < 12.0f) {
-            fall_detected_ = true;
-            if (print_mode_ & PRINT_MODE_STATE)
-                ESP_LOGW("CSI", "!!! FALL DETECTED !!!");
+    // ============================================================
+    // ★ PHÁT HIỆN FALL: SHOCK MẠNH (delta > 10) + STILL (nằm lâu)
+    // ============================================================
+    // ★ TĂNG NGƯỠNG SHOCK: delta > 10 (thay vì > 5)
+    bool shock = (rssi_delta > 10) && (avg_change > 10.0f);
+    
+    if (shock) {
+        shock_count++;
+        if (shock_count >= 8) {  // ~800ms
+            if (!fall_tracking) {
+                fall_tracking = true;
+                fall_start = now;
+                if (print_mode_ & PRINT_MODE_STATE)
+                    printf("SHOCK detected! delta=%d, amp=%.1f%%\n", rssi_delta, avg_change);
+            }
         }
-        shock_detected = false;
+    } else {
+        shock_count = 0;
+    }
+    
+    // STILL: đang nằm VÀ nằm được > 2 giây
+    bool still = is_lying_ && ((now - lying_start_time_) > 2000);
+    
+    // FALL = SHOCK (trong 2s) + STILL (nằm lâu)
+    if (fall_tracking && still && !fall_detected_) {
+        if ((now - fall_start) > 2000) {
+            fall_detected_ = true;
+            printf("!!! FALL DETECTED !!!\n");
+            fall_tracking = false;
+        }
+    }
+    
+    // Reset nếu quá lâu không có still
+    if (fall_tracking && (now - fall_start) > 5000) {
+        fall_tracking = false;
+        shock_count = 0;
+        printf("Fall tracking timeout\n");
+    }
+
+    if (fall_detected_ && (now - fall_start) > 10000) {
+        fall_detected_ = false;
+        printf("Fall reset\n");
     }
 }
 
-// ============================================================
-// MAIN TASK
-// ============================================================
 void CsiReceiver::s_process_task(void *arg) {
     auto *self = (CsiReceiver*)arg;
     csi_event_t ev;
@@ -264,9 +370,6 @@ void CsiReceiver::s_process_task(void *arg) {
     }
 }
 
-// ============================================================
-// STATS TASK
-// ============================================================
 void CsiReceiver::s_stats_task(void *arg) {
     auto *self = (CsiReceiver*)arg;
     uint32_t last = 0;
@@ -281,9 +384,6 @@ void CsiReceiver::s_stats_task(void *arg) {
     }
 }
 
-// ============================================================
-// INIT
-// ============================================================
 void CsiReceiver::init_nvs() {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -313,9 +413,6 @@ void CsiReceiver::begin() {
     init_wifi();
 
     extern uint8_t s_tx_mac[6];
-    ESP_LOGI("CSI", "TX MAC: %02X:%02X:%02X:%02X:%02X:%02X",
-             s_tx_mac[0], s_tx_mac[1], s_tx_mac[2],
-             s_tx_mac[3], s_tx_mac[4], s_tx_mac[5]);
     ESP_LOGI("CSI", "Channel: %d, Offset: 34", s_channel);
     ESP_LOGI("CSI", "CsiReceiver started");
 
