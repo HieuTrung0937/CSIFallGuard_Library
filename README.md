@@ -47,7 +47,7 @@ Thư viện được xây dựng trên nền **ESP-IDF**, hỗ trợ **PlatformI
 ## Cách 1: Clone trực tiếp
 
 ```bash
-git clone https://github.com/<username>/CSIFallGuard_Library.git
+git clone https://github.com/HieuTrung0937/CSIFallGuard_Library
 ```
 
 Sau đó copy thư viện vào:
@@ -76,7 +76,7 @@ Thêm vào `platformio.ini`
 
 ```ini
 lib_deps =
-    https://github.com/<username>/CSIFallGuard_Library.git
+    https://github.com/HieuTrung0937/CSIFallGuard_Library
 ```
 
 Sau đó chạy
